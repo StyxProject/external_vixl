@@ -3162,42 +3162,71 @@ void Simulator::VisitConditionalSelect(const Instruction* instr) {
 }
 
 
-// clang-format off
-#define PAUTH_MODES(V)                                       \
-  V(IA,  ReadXRegister(src), kPACKeyIA, kInstructionPointer) \
-  V(IB,  ReadXRegister(src), kPACKeyIB, kInstructionPointer) \
-  V(IZA, 0x00000000,         kPACKeyIA, kInstructionPointer) \
-  V(IZB, 0x00000000,         kPACKeyIB, kInstructionPointer) \
-  V(DA,  ReadXRegister(src), kPACKeyDA, kDataPointer)        \
-  V(DB,  ReadXRegister(src), kPACKeyDB, kDataPointer)        \
-  V(DZA, 0x00000000,         kPACKeyDA, kDataPointer)        \
-  V(DZB, 0x00000000,         kPACKeyDB, kDataPointer)
-// clang-format on
+#define PAUTH_MODES_REGISTER_CONTEXT(V) \
+  V(IA, kPACKeyIA, kInstructionPointer) \
+  V(IB, kPACKeyIB, kInstructionPointer) \
+  V(DA, kPACKeyDA, kDataPointer)        \
+  V(DB, kPACKeyDB, kDataPointer)
+
+#define PAUTH_MODES_ZERO_CONTEXT(V)      \
+  V(IZA, kPACKeyIA, kInstructionPointer) \
+  V(IZB, kPACKeyIB, kInstructionPointer) \
+  V(DZA, kPACKeyDA, kDataPointer)        \
+  V(DZB, kPACKeyDB, kDataPointer)
 
 void Simulator::VisitDataProcessing1Source(const Instruction* instr) {
   unsigned dst = instr->GetRd();
   unsigned src = instr->GetRn();
 
   switch (instr->Mask(DataProcessing1SourceMask)) {
-#define DEFINE_PAUTH_FUNCS(SUFFIX, MOD, KEY, D)     \
+#define DEFINE_PAUTH_FUNCS(SUFFIX, KEY, D)          \
   case PAC##SUFFIX: {                               \
+    uint64_t mod = ReadXRegister(src);              \
     uint64_t ptr = ReadXRegister(dst);              \
-    WriteXRegister(dst, AddPAC(ptr, MOD, KEY, D));  \
+    WriteXRegister(dst, AddPAC(ptr, mod, KEY, D));  \
     break;                                          \
   }                                                 \
   case AUT##SUFFIX: {                               \
+    uint64_t mod = ReadXRegister(src);              \
     uint64_t ptr = ReadXRegister(dst);              \
-    WriteXRegister(dst, AuthPAC(ptr, MOD, KEY, D)); \
+    WriteXRegister(dst, AuthPAC(ptr, mod, KEY, D)); \
     break;                                          \
   }
 
-    PAUTH_MODES(DEFINE_PAUTH_FUNCS)
+    PAUTH_MODES_REGISTER_CONTEXT(DEFINE_PAUTH_FUNCS)
+#undef DEFINE_PAUTH_FUNCS
+
+#define DEFINE_PAUTH_FUNCS(SUFFIX, KEY, D)          \
+  case PAC##SUFFIX: {                               \
+    if (src != kZeroRegCode) {                      \
+      VIXL_UNIMPLEMENTED();                         \
+    }                                               \
+    uint64_t ptr = ReadXRegister(dst);              \
+    WriteXRegister(dst, AddPAC(ptr, 0x0, KEY, D));  \
+    break;                                          \
+  }                                                 \
+  case AUT##SUFFIX: {                               \
+    if (src != kZeroRegCode) {                      \
+      VIXL_UNIMPLEMENTED();                         \
+    }                                               \
+    uint64_t ptr = ReadXRegister(dst);              \
+    WriteXRegister(dst, AuthPAC(ptr, 0x0, KEY, D)); \
+    break;                                          \
+  }
+
+    PAUTH_MODES_ZERO_CONTEXT(DEFINE_PAUTH_FUNCS)
 #undef DEFINE_PAUTH_FUNCS
 
     case XPACI:
+      if (src != kZeroRegCode) {
+        VIXL_UNIMPLEMENTED();
+      }
       WriteXRegister(dst, StripPAC(ReadXRegister(dst), kInstructionPointer));
       break;
     case XPACD:
+      if (src != kZeroRegCode) {
+        VIXL_UNIMPLEMENTED();
+      }
       WriteXRegister(dst, StripPAC(ReadXRegister(dst), kDataPointer));
       break;
     case RBIT_w:
@@ -8964,25 +8993,33 @@ void Simulator::VisitSVEIntCompareScalarCountAndLimit(
   unsigned rm_code = instr->GetRm();
   SimPRegister& pd = ReadPRegister(instr->GetPd());
   VectorFormat vform = instr->GetSVEVectorFormat();
+
   bool is_64_bit = instr->ExtractBit(12) == 1;
-  int64_t src1 = is_64_bit ? ReadXRegister(rn_code) : ReadWRegister(rn_code);
-  int64_t src2 = is_64_bit ? ReadXRegister(rm_code) : ReadWRegister(rm_code);
+  int rsize = is_64_bit ? kXRegSize : kWRegSize;
+  uint64_t mask = is_64_bit ? kXRegMask : kWRegMask;
+
+  uint64_t usrc1 = ReadXRegister(rn_code);
+  int64_t ssrc2 = is_64_bit ? ReadXRegister(rm_code) : ReadWRegister(rm_code);
+  uint64_t usrc2 = ssrc2 & mask;
 
   bool last = true;
   for (int lane = 0; lane < LaneCountFromFormat(vform); lane++) {
+    usrc1 &= mask;
+    int64_t ssrc1 = ExtractSignedBitfield64(rsize - 1, 0, usrc1);
+
     bool cond = false;
     switch (instr->Mask(SVEIntCompareScalarCountAndLimitMask)) {
       case WHILELE_p_p_rr:
-        cond = src1 <= src2;
+        cond = ssrc1 <= ssrc2;
         break;
       case WHILELO_p_p_rr:
-        cond = static_cast<uint64_t>(src1) < static_cast<uint64_t>(src2);
+        cond = usrc1 < usrc2;
         break;
       case WHILELS_p_p_rr:
-        cond = static_cast<uint64_t>(src1) <= static_cast<uint64_t>(src2);
+        cond = usrc1 <= usrc2;
         break;
       case WHILELT_p_p_rr:
-        cond = src1 < src2;
+        cond = ssrc1 < ssrc2;
         break;
       default:
         VIXL_UNIMPLEMENTED();
@@ -8991,7 +9028,7 @@ void Simulator::VisitSVEIntCompareScalarCountAndLimit(
     last = last && cond;
     LogicPRegister dst(pd);
     dst.SetActive(vform, lane, last);
-    src1 += 1;
+    usrc1++;
   }
 
   PredTest(vform, GetPTrue(), pd);
